@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+from functools import reduce
 from struct import pack, unpack
 from Crypto.PublicKey.RSA import construct
 from hashlib import sha256
@@ -46,6 +47,21 @@ def ms_array_dump(array, size, file):
         val = array[fast_addr]
         str_line += " %012x" % val
     print("%04x: %s" % ((fast_addr // 4) * 4, str_line), file=file)
+
+def get_even_bits(v):
+    bits = f'{v:048b}'
+    return [int(i) for i in bits[::2]]
+
+def get_odd_bits(v):
+    bits = f'{v:048b}'
+    return [int(i) for i in bits[1::2]]
+
+def crc_check(uop) -> str:
+    f_parity = lambda a,b: a^b
+    crc1 = reduce(f_parity, get_even_bits(uop & 0x3fffffffffff)) # Remove CRC from uop
+    crc2 = reduce(f_parity, get_odd_bits(uop & 0x3fffffffffff))
+    crc_ok = crc1 == ((uop >> 47) & 1) and crc2 == ((uop >> 46) & 1)
+    return '!' if not crc_ok else ''
 
 def parse_decrypted_ucode(ucode, output, description):
     print(f'[+] dumping parsed ucode to {output}')
@@ -115,7 +131,7 @@ def parse_decrypted_ucode(ucode, output, description):
                             patch = uaddr
                             match = current_patches[patch]
                             fprint(f'  <match & patch: 0x{match:04x} -> 0x{patch:04x}>')
-                        fprint(f'    [{uop:012x}] U{uaddr:04x}: {disasm_seqw_before} {disasm_uop} {disasm_seqw_after}')
+                        fprint(f'    {crc_check(uop)}[{uop:012x}] U{uaddr:04x}: {disasm_seqw_before} {disasm_uop} {disasm_seqw_after}')
                     else:
                         fprint(f'      [{seqword:08x}]')
 
@@ -350,8 +366,13 @@ def parse_ucode_file(f_ucode):
 
     rsa_sig = bytes(reversed(ucode[RSA_SIG_OFF:RSA_SIG_OFF+RSA_SIG_SIZE]))
 
+    # Monkey patched using pycryptodome internal functions, maybe not the best long term solution...
     pubkey = construct((rsa_modulus, rsa_exp))
-    plain_rsa_sig = pubkey.encrypt(rsa_sig, None)[0]
+    from Crypto.Util.number import bytes_to_long, ceil_div, long_to_bytes, size
+    modBits = size(pubkey.n)
+    k = ceil_div(modBits, 8) # Convert from bits to bytes
+    print(pubkey._encrypt(bytes_to_long(rsa_sig)))
+    plain_rsa_sig = long_to_bytes(pubkey._encrypt(bytes_to_long(rsa_sig)), k)
     desc = f"""
 [{f_ucode}]
     CPU: 0x{cpu_signature:x}
@@ -398,11 +419,8 @@ def parse_ucode_file(f_ucode):
         print('[+] decryption successful, signature matches')
         correct = True
     else:
-        print('[-] decryption failed')
+        print('[!] signature check failed. Up to some shenanigans?')
         correct = False
-    
-    if not correct:
-        return False
     
     print(f'[+] dumping decrypted to {f_ucode}.dec')
     with open(f'{f_ucode}.dec', 'wb') as f:
